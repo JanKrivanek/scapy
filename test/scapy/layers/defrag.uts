@@ -1,0 +1,358 @@
+% IP Fragment Reconstruction Tests
+
+############
+############
++ Fragment sorting: defrag() groups packets into not-fragmented, defragmented, and bad-fragments
+
+= defrag() - non-fragmented packets go into the first list
+pkt1 = IP(src="1.2.3.4", dst="5.6.7.8") / UDP() / (b"A" * 20)
+pkt2 = IP(src="10.0.0.1", dst="10.0.0.2") / TCP() / (b"B" * 20)
+result = defrag([pkt1, pkt2])
+not_frag, defragged, miss = result
+assert len(not_frag) == 2
+assert len(defragged) == 0
+assert len(miss) == 0
+
+= defrag() - fully reassembled fragments go into the second list
+pkt = IP(src="1.2.3.4", dst="5.6.7.8", id=0x1234) / UDP() / (b"X" * 100)
+frags = fragment(pkt, 40)
+assert len(frags) > 1
+not_frag, defragged, miss = defrag(frags)
+assert len(not_frag) == 0
+assert len(defragged) == 1
+assert len(miss) == 0
+
+= defrag() - missing last fragment puts packets into the third list
+pkt = IP(src="1.2.3.4", dst="5.6.7.8", id=0x5678) / UDP() / (b"Y" * 100)
+frags = fragment(pkt, 40)
+incomplete_frags = frags[:-1]
+not_frag, defragged, miss = defrag(incomplete_frags)
+assert len(not_frag) == 0
+assert len(defragged) == 0
+assert len(miss) == len(incomplete_frags)
+
+= defrag() - mixed: some packets complete, some not fragmented, some bad
+pkt_normal = IP(src="192.168.1.1", dst="192.168.1.2", id=0x0001) / UDP() / (b"N" * 20)
+pkt_complete = IP(src="192.168.1.3", dst="192.168.1.4", id=0x0002) / UDP() / (b"C" * 80)
+frags_complete = fragment(pkt_complete, 40)
+pkt_bad = IP(src="192.168.1.5", dst="192.168.1.6", id=0x0003) / UDP() / (b"B" * 80)
+frags_bad = fragment(pkt_bad, 40)[:-1]
+all_packets = [pkt_normal] + frags_complete + frags_bad
+not_frag, defragged, miss = defrag(all_packets)
+assert len(not_frag) == 1
+assert len(defragged) == 1
+assert len(miss) == len(frags_bad)
+
+= defrag() - first fragment missing results in bad fragment group
+pkt = IP(src="1.2.3.4", dst="5.6.7.8", id=0x9999) / UDP() / (b"Z" * 100)
+frags = fragment(pkt, 40)
+no_first = frags[1:]
+not_frag, defragged, miss = defrag(no_first)
+assert len(not_frag) == 0
+assert len(defragged) == 0
+assert len(miss) == len(no_first)
+
+
+############
+############
++ Fragment reconstruction: defragment() reassembles packets in order
+
+= defragment() - basic reassembly with in-order fragments
+original = IP(src="10.0.0.1", dst="10.0.0.2", id=0xAAAA) / UDP() / (b"T" * 200)
+frags = fragment(original, 64)
+assert len(frags) > 1
+result = defragment(frags)
+assert len(result) == 1
+assert raw(result[0][IP].payload) == raw(original[IP].payload)
+
+= defragment() - out-of-order fragments are sorted and reassembled correctly
+original = IP(src="10.0.0.1", dst="10.0.0.2", id=0xBBBB) / UDP() / (b"O" * 200)
+frags = fragment(original, 64)
+assert len(frags) >= 2
+reversed_frags = list(reversed(frags))
+result = defragment(reversed_frags)
+assert len(result) == 1
+assert raw(result[0][IP].payload) == raw(original[IP].payload)
+
+= defragment() - shuffled fragments are reassembled correctly
+import random
+original = IP(src="10.0.0.1", dst="10.0.0.2", id=0xCCCC) / UDP() / (b"S" * 300)
+frags = fragment(original, 64)
+assert len(frags) >= 4
+shuffled = frags[:]
+random.seed(42)
+random.shuffle(shuffled)
+result = defragment(shuffled)
+assert len(result) == 1
+assert raw(result[0][IP].payload) == raw(original[IP].payload)
+
+= defragment() - missing middle fragment leaves packet in miss list
+original = IP(src="10.0.0.1", dst="10.0.0.2", id=0xDDDD) / UDP() / (b"M" * 200)
+frags = fragment(original, 64)
+assert len(frags) >= 3
+missing_middle = frags[:1] + frags[2:]
+result = defragment(missing_middle)
+reconstructed = [p for p in result if IP in p and p[IP].frag == 0 and not p[IP].flags.MF and UDP in p and len(bytes(p[UDP].payload)) == 200]
+assert len(reconstructed) == 0
+
+= defragment() - result is a PacketList with 'Defragmented' in the name
+original = IP(src="10.0.0.1", dst="10.0.0.2", id=0xEEEE) / UDP() / (b"P" * 100)
+frags = fragment(original, 40)
+result = defragment(frags)
+assert "Defragmented" in result.listname
+
+
+############
+############
++ Timestamp handling: fragments arriving at different times
+
+= _defrag_list - timestamp of reassembled packet is the latest fragment time
+from scapy.layers.inet import _defrag_list
+original = IP(src="1.1.1.1", dst="2.2.2.2", id=0x1111) / UDP() / (b"T" * 200)
+frags = fragment(original, 64)
+assert len(frags) >= 3
+for i, frag in enumerate(frags):
+    frag.time = 1000.0 + i * 0.5
+    frag._defrag_pos = i
+
+last_time = frags[-1].time
+defrag_list = []
+missfrag_list = []
+_defrag_list(frags, defrag_list, missfrag_list)
+assert len(defrag_list) == 1
+assert defrag_list[0].time == last_time
+
+= _defrag_list - timestamp is max across all fragments even if not monotonic
+from scapy.layers.inet import _defrag_list
+original = IP(src="1.1.1.1", dst="2.2.2.2", id=0x2222) / UDP() / (b"U" * 200)
+frags = fragment(original, 64)
+assert len(frags) >= 3
+frags[0].time = 1000.0
+frags[1].time = 1005.0
+frags[2].time = 1003.0
+for i in range(3, len(frags)):
+    frags[i].time = 1001.0 + i
+
+for i, frag in enumerate(frags):
+    frag._defrag_pos = i
+
+max_time = max(f.time for f in frags)
+defrag_list = []
+missfrag_list = []
+_defrag_list(frags, defrag_list, missfrag_list)
+assert len(defrag_list) == 1
+assert defrag_list[0].time == max_time
+
+= defrag() - defragmented packet inherits the maximum timestamp from fragments
+original = IP(src="3.3.3.3", dst="4.4.4.4", id=0x3333) / UDP() / (b"V" * 100)
+frags = fragment(original, 40)
+assert len(frags) >= 2
+for i, frag in enumerate(frags):
+    frag.time = 100.0 + i * 50.0
+
+expected_max_time = max(f.time for f in frags)
+not_frag, defragged, miss = defrag(frags)
+assert len(defragged) == 1
+assert defragged[0].time == expected_max_time
+
+= IPSession - defragmented packet gets the timestamp of the last fragment received
+from scapy.sessions import IPSession
+original = IP(src="5.5.5.5", dst="6.6.6.6", id=0x4444) / UDP() / (b"W" * 200)
+frags = fragment(original, 64)
+assert len(frags) > 1
+for i, frag in enumerate(frags):
+    frag.time = float(1000 + i)
+
+last_frag_time = frags[-1].time
+session = IPSession()
+result = None
+for frag in frags:
+    r = session._ip_process_packet(frag)
+    if r is not None:
+        result = r
+
+assert result is not None
+assert result.time == last_frag_time
+
+
+############
+############
++ Behavior when first fragment is missing
+
+= defrag() - only non-first fragments are treated as bad fragments
+pkt = IP(src="7.7.7.7", dst="8.8.8.8", id=0x5555) / UDP() / (b"X" * 200)
+frags = fragment(pkt, 64)
+assert len(frags) >= 3
+no_first_frags = frags[1:]
+not_frag, defragged, miss = defrag(no_first_frags)
+assert len(not_frag) == 0
+assert len(defragged) == 0
+assert len(miss) == len(no_first_frags)
+
+= IPSession - missing first fragment: fragment group is discarded when last arrives
+from scapy.sessions import IPSession
+pkt = IP(src="9.9.9.9", dst="10.10.10.10", id=0x6666) / UDP() / (b"Y" * 200)
+frags = fragment(pkt, 64)
+assert len(frags) > 1
+no_first_frags = frags[1:]
+session = IPSession()
+results = []
+for frag in no_first_frags:
+    r = session._ip_process_packet(frag)
+    if r is not None:
+        results.append(r)
+
+assert len(results) == 0
+
+= _defrag_list - fragment list starting with frag>0 is put into missfrag list
+from scapy.layers.inet import _defrag_list
+pkt = IP(src="11.11.11.11", dst="12.12.12.12", id=0x7777) / UDP() / (b"Z" * 100)
+frags = fragment(pkt, 40)
+assert len(frags) >= 2
+no_first = frags[1:]
+defrag_list = []
+missfrag_list = []
+_defrag_list(no_first, defrag_list, missfrag_list)
+assert len(defrag_list) == 0
+assert len(missfrag_list) == len(no_first)
+
+= IPSession - first fragment alone (not reassembled) does not return a packet
+from scapy.sessions import IPSession
+pkt = IP(src="13.13.13.13", dst="14.14.14.14", id=0x8888) / UDP() / (b"A" * 200)
+frags = fragment(pkt, 64)
+assert len(frags) >= 2
+session = IPSession()
+result = session._ip_process_packet(frags[0])
+assert result is None
+
+
+############
+############
++ Real-world scenarios: large DNS responses split across multiple fragments
+
+= Large DNS response over UDP is fragmented and reassembled correctly
+from scapy.layers.dns import DNS, DNSRR, DNSQR
+dns_response = DNS(
+    id=0x1234,
+    qr=1,
+    aa=1,
+    qd=DNSQR(qname="example.com", qtype="A"),
+    an=DNSRR(rrname="example.com", rdata="1.2.3.4", ttl=300) /
+       DNSRR(rrname="example.com", rdata="5.6.7.8", ttl=300) /
+       DNSRR(rrname="example.com", rdata="9.10.11.12", ttl=300) /
+       DNSRR(rrname="example.com", rdata="13.14.15.16", ttl=300)
+)
+pkt = IP(src="8.8.8.8", dst="192.168.1.100", id=0xABCD) / UDP(sport=53, dport=12345) / dns_response
+frags = fragment(pkt, 100)
+assert len(frags) >= 2
+not_frag, defragged, miss = defrag(frags)
+assert len(not_frag) == 0
+assert len(defragged) == 1
+assert len(miss) == 0
+reassembled = defragged[0]
+assert DNS in reassembled
+assert reassembled[DNS].id == 0x1234
+assert reassembled[DNS].ancount == 4
+
+= Large DNS response: out-of-order fragments are reassembled correctly
+from scapy.layers.dns import DNS, DNSRR, DNSQR
+dns_response = DNS(
+    id=0xDEAD,
+    qr=1,
+    aa=1,
+    qd=DNSQR(qname="test.example.org", qtype="A"),
+    an=DNSRR(rrname="test.example.org", rdata="192.168.1.1", ttl=60) /
+       DNSRR(rrname="test.example.org", rdata="192.168.1.2", ttl=60) /
+       DNSRR(rrname="test.example.org", rdata="192.168.1.3", ttl=60)
+)
+pkt = IP(src="1.1.1.1", dst="10.0.0.1", id=0xBEEF) / UDP(sport=53, dport=5353) / dns_response
+frags = fragment(pkt, 80)
+assert len(frags) >= 2
+reversed_frags = list(reversed(frags))
+result = defragment(reversed_frags)
+dns_pkts = [p for p in result if DNS in p]
+assert len(dns_pkts) == 1
+assert dns_pkts[0][DNS].id == 0xDEAD
+
+= Large DNS response via IPSession with in-order fragment delivery
+from scapy.layers.dns import DNS, DNSRR, DNSQR
+from scapy.sessions import IPSession
+dns_response = DNS(
+    id=0xCAFE,
+    qr=1,
+    aa=1,
+    qd=DNSQR(qname="big.example.net", qtype="A"),
+    an=DNSRR(rrname="big.example.net", rdata="172.16.0.1", ttl=120) /
+       DNSRR(rrname="big.example.net", rdata="172.16.0.2", ttl=120) /
+       DNSRR(rrname="big.example.net", rdata="172.16.0.3", ttl=120) /
+       DNSRR(rrname="big.example.net", rdata="172.16.0.4", ttl=120) /
+       DNSRR(rrname="big.example.net", rdata="172.16.0.5", ttl=120)
+)
+pkt = IP(src="8.8.4.4", dst="192.168.0.100", id=0xFACE) / UDP(sport=53, dport=54321) / dns_response
+frags = fragment(pkt, 72)
+assert len(frags) >= 2
+session = IPSession()
+result = None
+for frag in frags:
+    r = session._ip_process_packet(frag)
+    if r is not None:
+        result = r
+
+assert result is not None
+assert DNS in result
+assert result[DNS].id == 0xCAFE
+
+= DNS fragmented across exactly two fragments
+from scapy.layers.dns import DNS, DNSRR, DNSQR
+dns_ans = DNS(
+    id=0x0042,
+    qr=1,
+    qd=DNSQR(qname="splitme.example.com"),
+    an=DNSRR(rrname="splitme.example.com", rdata="10.20.30.40", ttl=300) /
+       DNSRR(rrname="splitme.example.com", rdata="50.60.70.80", ttl=300)
+)
+full_pkt = IP(src="9.9.9.9", dst="192.168.100.1", id=0x1357) / UDP(sport=53, dport=2000) / dns_ans
+frags = fragment(full_pkt, 64)
+assert len(frags) == 2
+not_frag, defragged, miss = defrag(frags)
+assert len(defragged) == 1
+assert DNS in defragged[0]
+assert defragged[0][DNS].id == 0x0042
+
+
+############
+############
++ defrag() ordering: original packet positions are preserved
+
+= defragment() handles multiple independent fragment streams simultaneously
+pkt1 = IP(src="1.1.1.1", dst="2.2.2.2", id=0x0001) / UDP() / (b"A" * 200)
+pkt2 = IP(src="3.3.3.3", dst="4.4.4.4", id=0x0002) / UDP() / (b"B" * 200)
+frags1 = fragment(pkt1, 64)
+frags2 = fragment(pkt2, 64)
+interleaved = []
+for f1, f2 in zip(frags1, frags2):
+    interleaved.append(f1)
+    interleaved.append(f2)
+
+n = min(len(frags1), len(frags2))
+interleaved.extend(frags1[n:])
+interleaved.extend(frags2[n:])
+not_frag, defragged, miss = defrag(interleaved)
+assert len(defragged) == 2
+assert len(miss) == 0
+payloads = sorted([bytes(p[UDP].payload) for p in defragged])
+assert b"A" * 200 in payloads
+assert b"B" * 200 in payloads
+
+= defragment() includes non-fragmented, defragmented, and miss packets in output
+pkt_a = IP(src="1.1.1.1", dst="2.2.2.2", id=0x0010) / UDP() / (b"A" * 20)
+pkt_b_orig = IP(src="3.3.3.3", dst="4.4.4.4", id=0x0020) / UDP() / (b"B" * 200)
+frags_b = fragment(pkt_b_orig, 64)
+pkt_c = IP(src="5.5.5.5", dst="6.6.6.6", id=0x0030) / UDP() / (b"C" * 20)
+combined = [pkt_a] + frags_b + [pkt_c]
+result = defragment(combined)
+assert len(result) == 3
+udp_payloads = [bytes(p[UDP].payload) for p in result if UDP in p]
+assert b"A" * 20 in udp_payloads
+assert b"B" * 200 in udp_payloads
+assert b"C" * 20 in udp_payloads
