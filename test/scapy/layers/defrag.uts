@@ -1,0 +1,326 @@
+% Fragment reconstruction workflow tests for Scapy
+
+# Tests covering:
+# - Sorting packets into groups (defrag vs missfrag)
+# - Reconstructing from out-of-order or incomplete fragment lists
+# - Timestamp handling when fragments arrive at different times
+# - Behavior when first fragment is missing
+# - Real-world scenario: large DNS response across multiple fragments
+
+############
+############
++ Setup helpers
+
+= Import helpers
+from scapy.layers.inet import IP, UDP, TCP, fragment, defrag, defragment, _defrag_list, _defrag_logic
+from scapy.layers.dns import DNS, DNSQR, DNSRR
+from scapy.packet import Raw
+from scapy.plist import PacketList
+
+def make_frags(payload, fragsize=8, src="1.2.3.4", dst="5.6.7.8", proto=17, pkt_id=1):
+    """Build a list of IPv4 fragments for the given payload."""
+    pkt = IP(src=src, dst=dst, proto=proto, id=pkt_id) / Raw(load=payload)
+    return fragment(pkt, fragsize)
+
+############
+############
++ Sorting packets into defragmented vs missfrag groups
+
+= defrag() splits non-fragmented, defragmented, and incomplete into three lists
+* Build a normal (non-fragmented) packet and two complete-fragment groups
+non_frag = IP(src="1.2.3.4", dst="5.6.7.8") / Raw(load=b"hello")
+frags_a = make_frags(b"A" * 48, fragsize=16, pkt_id=10)
+frags_b = make_frags(b"B" * 48, fragsize=16, pkt_id=20)
+plist = PacketList([non_frag] + frags_a + frags_b)
+ok, defragged, miss = defrag(plist)
+* Non-fragmented packet goes into 'ok'
+assert len(ok) == 1
+* Both fragment groups are successfully defragmented
+assert len(defragged) == 2
+* Nothing ends up in the incomplete bucket
+assert len(miss) == 0
+
+= defrag() puts incomplete groups in missfrag
+* Remove the last fragment so the group has MF still set on the final entry
+frags = make_frags(b"C" * 48, fragsize=16, pkt_id=30)
+incomplete = frags[:-1]  # drop last fragment (the one with MF=0)
+ok2, defragged2, miss2 = defrag(PacketList(incomplete))
+assert len(ok2) == 0
+assert len(defragged2) == 0
+* All incomplete fragments go to missfrag
+assert len(miss2) == len(incomplete)
+
+= defrag() handles a mix of complete and incomplete groups
+frags_complete = make_frags(b"D" * 32, fragsize=16, pkt_id=40)
+frags_incomplete = make_frags(b"E" * 32, fragsize=16, pkt_id=50)[:-1]
+plist_mix = PacketList(frags_complete + frags_incomplete)
+ok3, defragged3, miss3 = defrag(plist_mix)
+assert len(defragged3) == 1
+assert len(miss3) == len(frags_incomplete)
+
+= defragment() returns a single merged PacketList preserving original order
+non_frag2 = IP(src="10.0.0.1", dst="10.0.0.2") / Raw(load=b"z" * 8)
+frags_c = make_frags(b"F" * 32, fragsize=16, pkt_id=60)
+* Mix non-fragmented and fragments
+combined = PacketList([non_frag2] + frags_c)
+result = defragment(combined)
+* Result should contain the non-frag packet + the reassembled packet
+assert len(result) == 2
+
+############
+############
++ Reconstructing from out-of-order fragment lists
+
+= _defrag_logic sorts fragments by offset before reassembly
+payload = b"0123456789abcdef" * 3   # 48 bytes
+frags = make_frags(payload, fragsize=16, pkt_id=100)
+* Reverse the fragment order to simulate out-of-order arrival
+reversed_frags = list(reversed(frags))
+ok4, defragged4, miss4 = defrag(PacketList(reversed_frags))
+assert len(defragged4) == 1
+* Payload must equal original
+reassembled = defragged4[0]
+assert bytes(reassembled[IP].payload) == payload
+
+= defrag() reassembles fragments regardless of arrival order
+payload2 = b"XY" * 40   # 80 bytes
+frags2 = make_frags(payload2, fragsize=16, pkt_id=200)
+* Shuffle: put last fragment first
+shuffled = [frags2[-1]] + frags2[1:-1] + [frags2[0]]
+ok5, defragged5, miss5 = defrag(PacketList(shuffled))
+assert len(defragged5) == 1
+assert bytes(defragged5[0][IP].payload) == payload2
+
+= _defrag_list detects fragment offset gaps and moves group to missfrag
+* Build two valid fragments then craft a third with a wrong offset
+frags3 = make_frags(b"G" * 48, fragsize=16, pkt_id=300)
+bad_frag = frags3[1].copy()
+* Force a gap: offset should be 2 (16 bytes // 8), set it to 5 to create a gap
+bad_frag[IP].frag = 5
+lst = [frags3[0], bad_frag, frags3[2]]
+defrag_out = []
+missfrag_out = []
+_defrag_list(lst, defrag_out, missfrag_out)
+* With the gap the group must land in missfrag
+assert len(defrag_out) == 0
+assert len(missfrag_out) == len(lst)
+
+############
+############
++ Timestamp handling when fragments arrive at different times
+
+= defrag() picks the maximum timestamp from all fragments
+frags_ts = make_frags(b"T" * 48, fragsize=16, pkt_id=400)
+* Assign monotonically increasing timestamps to simulate arrival times
+for i, f in enumerate(frags_ts):
+    f.time = 1000.0 + i * 0.5
+
+expected_max_time = frags_ts[-1].time
+ok6, defragged6, miss6 = defrag(PacketList(frags_ts))
+assert len(defragged6) == 1
+assert defragged6[0].time == expected_max_time
+
+= defrag() picks max timestamp even when fragments arrive out of order
+frags_ts2 = make_frags(b"U" * 48, fragsize=16, pkt_id=500)
+* Assign timestamps out of arrival order
+frags_ts2[0].time = 3000.0   # first fragment arrives latest (highest timestamp)
+frags_ts2[1].time = 1000.0
+frags_ts2[2].time = 2000.0
+ok7, defragged7, miss7 = defrag(PacketList(frags_ts2))
+assert len(defragged7) == 1
+* Max timestamp should be 3000.0
+assert defragged7[0].time == 3000.0
+
+= _defrag_list propagates the highest timestamp to the reconstructed packet
+frags_ts3 = make_frags(b"V" * 32, fragsize=16, pkt_id=600)
+* _defrag_list requires _defrag_pos to be set on each packet (normally done by _defrag_logic)
+for idx, f in enumerate(frags_ts3):
+    f._defrag_pos = idx
+
+frags_ts3[0].time = 5.0
+frags_ts3[1].time = 99.0
+defrag_ts = []
+miss_ts = []
+_defrag_list(frags_ts3, defrag_ts, miss_ts)
+assert len(defrag_ts) == 1
+assert defrag_ts[0].time == 99.0
+
+############
+############
++ Behavior when first fragment is missing
+
+= defrag() puts all fragments in missfrag when first fragment (offset 0) is missing
+frags_nofirst = make_frags(b"W" * 48, fragsize=16, pkt_id=700)
+* Drop the first fragment (the one with frag offset = 0)
+without_first = frags_nofirst[1:]
+ok8, defragged8, miss8 = defrag(PacketList(without_first))
+assert len(defragged8) == 0
+assert len(miss8) == len(without_first)
+
+= _defrag_list returns without defragging when first fragment is absent
+frags_nofirst2 = make_frags(b"X" * 32, fragsize=16, pkt_id=800)
+no_first_lst = frags_nofirst2[1:]   # drop offset-0 fragment
+defrag_nf = []
+miss_nf = []
+_defrag_list(no_first_lst, defrag_nf, miss_nf)
+assert len(defrag_nf) == 0
+assert len(miss_nf) == len(no_first_lst)
+
+= IPSession ignores fragments when first fragment is absent
+from scapy.sessions import IPSession
+received = []
+session = IPSession(prn=received.append, store=False)
+frags_sess = make_frags(b"Y" * 48, fragsize=16, pkt_id=900)
+* Feed all fragments except the first one
+for f in frags_sess[1:]:
+    session.on_packet_received(f)
+
+* Nothing should be yielded since we never got frag offset=0
+assert len(received) == 0
+
+= defrag() with only the first fragment (no MF=0 last) goes to missfrag
+frags_nolast = make_frags(b"Z" * 48, fragsize=16, pkt_id=1000)
+only_first = frags_nolast[:1]    # only the very first fragment (has MF set)
+ok9, defragged9, miss9 = defrag(PacketList(only_first))
+assert len(defragged9) == 0
+assert len(miss9) == 1
+
+############
+############
++ Real-world scenario: large DNS response split across multiple fragments
+
+= Large DNS response over UDP is correctly reconstructed from fragments
+* Build a DNS response packet large enough to require fragmentation
+dns_answers = [
+    DNSRR(rrname="example.com.", type="A", ttl=300, rdata="1.2.3.%d" % i)
+    for i in range(20)
+]
+dns_pkt = (
+    IP(src="8.8.8.8", dst="192.168.1.1", id=2000) /
+    UDP(sport=53, dport=12345) /
+    DNS(
+        id=0x1234,
+        qr=1,
+        aa=1,
+        qdcount=1,
+        ancount=len(dns_answers),
+        qd=DNSQR(qname="example.com."),
+        an=dns_answers[0]
+    )
+)
+* Append remaining answers manually to keep one big payload
+for rr in dns_answers[1:]:
+    dns_pkt[DNS].an = dns_pkt[DNS].an / rr
+
+dns_raw = raw(dns_pkt)
+* Fragment the IP layer at 200-byte fragment size to create multiple pieces
+dns_frags = fragment(dns_pkt, 200)
+* Must have produced more than one fragment
+assert len(dns_frags) > 1
+* All fragments except last must have MF set
+assert all(f[IP].flags.MF for f in dns_frags[:-1])
+assert not dns_frags[-1][IP].flags.MF
+
+ok_d, defrag_d, miss_d = defrag(PacketList(dns_frags))
+assert len(defrag_d) == 1
+reassembled_dns = defrag_d[0]
+* Reassembled payload must match the original IP payload
+original_payload = bytes(dns_pkt[IP].payload)
+reassembled_payload = bytes(reassembled_dns[IP].payload)
+assert reassembled_payload == original_payload
+
+= Large DNS response fragments reassemble correctly when delivered out of order
+dns_pkt2 = (
+    IP(src="8.8.8.8", dst="192.168.1.2", id=3000) /
+    UDP(sport=53, dport=54321) /
+    DNS(
+        id=0x5678,
+        qr=1,
+        qdcount=1,
+        ancount=5,
+        qd=DNSQR(qname="test.example."),
+        an=(
+            DNSRR(rrname="test.example.", type="A", ttl=60, rdata="10.0.0.1") /
+            DNSRR(rrname="test.example.", type="A", ttl=60, rdata="10.0.0.2") /
+            DNSRR(rrname="test.example.", type="A", ttl=60, rdata="10.0.0.3") /
+            DNSRR(rrname="test.example.", type="A", ttl=60, rdata="10.0.0.4") /
+            DNSRR(rrname="test.example.", type="A", ttl=60, rdata="10.0.0.5")
+        )
+    )
+)
+dns_frags2 = fragment(dns_pkt2, 64)
+assert len(dns_frags2) > 1
+* Reverse fragment order to simulate out-of-order delivery
+dns_frags_reversed = list(reversed(dns_frags2))
+ok_d2, defrag_d2, miss_d2 = defrag(PacketList(dns_frags_reversed))
+assert len(defrag_d2) == 1
+expected_payload = bytes(dns_pkt2[IP].payload)
+assert bytes(defrag_d2[0][IP].payload) == expected_payload
+
+= Large DNS response with missing middle fragment ends up in missfrag
+dns_pkt3 = (
+    IP(src="8.8.8.8", dst="192.168.1.3", id=4000) /
+    UDP(sport=53, dport=11111) /
+    DNS(
+        id=0x9abc,
+        qr=1,
+        qdcount=1,
+        ancount=3,
+        qd=DNSQR(qname="missing.example."),
+        an=(
+            DNSRR(rrname="missing.example.", type="A", ttl=60, rdata="172.16.0.1") /
+            DNSRR(rrname="missing.example.", type="A", ttl=60, rdata="172.16.0.2") /
+            DNSRR(rrname="missing.example.", type="A", ttl=60, rdata="172.16.0.3")
+        )
+    )
+)
+dns_frags3 = fragment(dns_pkt3, 64)
+assert len(dns_frags3) > 2, "Need at least 3 fragments to drop middle one"
+* Drop a middle fragment to create a gap
+frags_with_gap = [dns_frags3[0]] + dns_frags3[2:]
+ok_d3, defrag_d3, miss_d3 = defrag(PacketList(frags_with_gap))
+assert len(defrag_d3) == 0
+assert len(miss_d3) > 0
+
+############
+############
++ Additional edge cases for defrag workflow
+
+= defrag() correctly groups fragments by (id, src, dst, proto) tuple
+* Two flows with same id but different source should not be mixed
+frags_flow1 = make_frags(b"A" * 32, fragsize=16, src="1.1.1.1", dst="2.2.2.2", pkt_id=9999)
+frags_flow2 = make_frags(b"B" * 32, fragsize=16, src="3.3.3.3", dst="2.2.2.2", pkt_id=9999)
+interleaved = []
+for f1, f2 in zip(frags_flow1, frags_flow2):
+    interleaved.append(f1)
+    interleaved.append(f2)
+
+ok10, defragged10, miss10 = defrag(PacketList(interleaved))
+* Both flows should be independently reassembled
+assert len(defragged10) == 2
+
+= defragment() preserves the relative position of reassembled vs non-fragmented packets
+non_frag_a = IP(src="10.0.0.1", dst="10.0.0.2") / Raw(load=b"first")
+frags_mid = make_frags(b"M" * 32, fragsize=16, pkt_id=5555)
+non_frag_b = IP(src="10.0.0.3", dst="10.0.0.4") / Raw(load=b"last")
+plist_order = PacketList([non_frag_a] + frags_mid + [non_frag_b])
+result_order = defragment(plist_order)
+* Should have 3 packets: first non-frag, reassembled, last non-frag
+assert len(result_order) == 3
+* First packet is the non-fragmented "first" packet
+assert bytes(result_order[0][IP].payload) == b"first"
+* Last packet is the non-fragmented "last" packet
+assert bytes(result_order[2][IP].payload) == b"last"
+
+= Single-fragment packet (no fragmentation needed) passes through defrag unchanged
+single = IP(src="9.9.9.9", dst="8.8.8.8") / Raw(load=b"tiny")
+ok11, defragged11, miss11 = defrag(PacketList([single]))
+assert len(ok11) == 1
+assert len(defragged11) == 0
+assert len(miss11) == 0
+
+= defrag() result is empty PacketLists when given an empty input
+ok12, defragged12, miss12 = defrag(PacketList([]))
+assert len(ok12) == 0
+assert len(defragged12) == 0
+assert len(miss12) == 0
